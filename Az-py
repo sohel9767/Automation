@@ -1,0 +1,99 @@
+import requests
+import msal
+import datetime
+import os
+
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
+from automationassets import get_automation_variable
+
+# Load credentials from Automation variables
+CLIENT_ID = get_automation_variable("client_id")
+CLIENT_SECRET = get_automation_variable("client_secret")
+TENANT_ID = get_automation_variable("tenant_id")
+EMAIL_SENDER = get_automation_variable("email_sender")
+EMAIL_RECIPIENT = get_automation_variable("email_recipient")
+
+# MS Graph config
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+SCOPE = ["https://graph.microsoft.com/.default"]
+GRAPH_URL = "https://graph.microsoft.com/v1.0"
+
+# Acquire token
+app = msal.ConfidentialClientApplication(
+    CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_SECRET
+)
+token_result = app.acquire_token_for_client(scopes=SCOPE)
+
+if "access_token" not in token_result:
+    raise Exception("Could not acquire token: " + str(token_result.get("error_description")))
+
+headers = {
+    "Authorization": f"Bearer {token_result['access_token']}",
+    "Content-Type": "application/json"
+}
+
+# Date threshold
+now = datetime.datetime.utcnow()
+threshold = now + datetime.timedelta(days=30)
+
+# Fetch all applications
+apps = []
+url = f"{GRAPH_URL}/applications?$select=displayName,passwordCredentials"
+while url:
+    res = requests.get(url, headers=headers)
+    if res.status_code != 200:
+        raise Exception(f"Error fetching apps: {res.status_code} - {res.text}")
+    data = res.json()
+    apps.extend(data.get("value", []))
+    url = data.get("@odata.nextLink")
+
+# Identify expiring secrets
+expiring = []
+for app in apps:
+    app_name = app.get("displayName", "Unknown")
+    for cred in app.get("passwordCredentials", []):
+        exp_date_str = cred.get("endDateTime")
+        if exp_date_str:
+            exp_date = datetime.datetime.strptime(exp_date_str, "%Y-%m-%dT%H:%M:%SZ")
+            if now <= exp_date <= threshold:
+                expiring.append({
+                    "App Name": app_name,
+                    "Secret Name": cred.get("displayName", "N/A"),
+                    "Expires On": exp_date.strftime("%Y-%m-%d")
+                })
+
+# Send email if any expiring secrets
+if expiring:
+    html_table = "<table border='1'><tr><th>App Name</th><th>Secret Name</th><th>Expires On</th></tr>"
+    for item in expiring:
+        html_table += f"<tr><td>{item['App Name']}</td><td>{item['Secret Name']}</td><td>{item['Expires On']}</td></tr>"
+    html_table += "</table>"
+
+    email_payload = {
+        "message": {
+            "subject": "Azure App Registration Secrets Expiring Soon",
+            "body": {
+                "contentType": "HTML",
+                "content": f"<p>The following secrets are expiring within 30 days:</p>{html_table}"
+            },
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": EMAIL_RECIPIENT
+                    }
+                }
+            ]
+        },
+        "saveToSentItems": "false"
+    }
+
+    # Send email via Graph API
+    send_url = f"{GRAPH_URL}/users/{EMAIL_SENDER}/sendMail"
+    res = requests.post(send_url, headers=headers, json=email_payload)
+    if res.status_code != 202:
+        raise Exception(f"Failed to send email: {res.status_code} - {res.text}")
+    else:
+        print("Email sent successfully.")
+else:
+    print("No expiring secrets found.")
