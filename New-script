@@ -1,0 +1,60 @@
+# Connect to Microsoft Graph using Managed Identity
+Connect-MgGraph -Identity
+
+# Initialize collection
+$expiringSecrets = @()
+
+# Get all applications
+$applications = Get-MgApplication -All
+
+# Loop through applications and check secrets
+foreach ($app in $applications) {
+    if ($app.PasswordCredentials) {
+        foreach ($secret in $app.PasswordCredentials) {
+            $daysLeft = ($secret.EndDateTime - (Get-Date)).Days
+            if ($daysLeft -le 30) {
+                try {
+                    $owners = Get-MgApplicationOwner -ApplicationId $app.Id | Select-Object -ExpandProperty UserPrincipalName
+                    if (-not $owners) {
+                        $owners = @("fallback@email.com")
+                    }
+                } catch {
+                    $owners = @("fallback@email.com")
+                }
+
+                $expiringSecrets += [PSCustomObject]@{
+                    AppName    = $app.DisplayName
+                    AppId      = $app.AppId
+                    ExpiryDate = $secret.EndDateTime
+                    DaysLeft   = $daysLeft
+                    Owners     = ($owners -join ", ")
+                }
+            }
+        }
+    }
+}
+
+# Exit if nothing is expiring
+if (-not $expiringSecrets) {
+    Write-Output "No expiring secrets found within 30 days."
+    return
+}
+
+# Format the report as HTML
+$emailBody = $expiringSecrets | ConvertTo-Html -Property AppName, AppId, ExpiryDate, DaysLeft, Owners -PreContent "<h2>Expiring App Registration Secrets (Next 30 Days)</h2>" | Out-String
+
+# Send email using Microsoft Graph API
+Send-MgUserMail -UserId "sohel.pattewale@evicore.com" -Message @{
+    Subject = "Expiring App Secrets Report"
+    Body = @{
+        ContentType = "HTML"
+        Content = $emailBody
+    }
+    ToRecipients = @(
+        @{
+            EmailAddress = @{
+                Address = "42@evicore.com"
+            }
+        }
+    )
+} -SaveToSentItems:$false
