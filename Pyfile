@@ -1,0 +1,94 @@
+import requests
+import datetime
+import os
+from msal import ConfidentialClientApplication
+
+TENANT_ID = os.environ["TENANT_ID"]
+CLIENT_ID = os.environ["CLIENT_ID"]
+CLIENT_SECRET = os.environ["CLIENT_SECRET"]
+SENDER_EMAIL = os.environ["SENDER_EMAIL"]
+RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"]
+
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+SCOPE = ["https://graph.microsoft.com/.default"]
+
+app = ConfidentialClientApplication(
+    client_id=CLIENT_ID,
+    authority=AUTHORITY,
+    client_credential=CLIENT_SECRET
+)
+token_response = app.acquire_token_for_client(scopes=SCOPE)
+access_token = token_response["access_token"]
+headers = {"Authorization": f"Bearer {access_token}"}
+
+applications = []
+url = "https://graph.microsoft.com/v1.0/applications?$top=100"
+
+while url:
+    res = requests.get(url, headers=headers).json()
+    applications.extend(res.get("value", []))
+    url = res.get("@odata.nextLink")
+
+today = datetime.datetime.utcnow()
+threshold = today + datetime.timedelta(days=30)
+expiring = []
+
+for app_data in applications:
+    secrets = app_data.get("passwordCredentials", [])
+    for secret in secrets:
+        expiry = datetime.datetime.strptime(secret["endDateTime"], "%Y-%m-%dT%H:%M:%SZ")
+        if today < expiry <= threshold:
+            owners_url = f"https://graph.microsoft.com/v1.0/applications/{app_data['id']}/owners"
+            owners_res = requests.get(owners_url, headers=headers).json()
+            owners = [o.get("userPrincipalName", "N/A") for o in owners_res.get("value", [])]
+
+            expiring.append({
+                "displayName": app_data.get("displayName", "N/A"),
+                "appId": app_data.get("appId", "N/A"),
+                "expiryDate": expiry.strftime("%Y-%m-%d"),
+                "owners": ", ".join(owners)
+            })
+
+if not expiring:
+    print("No secrets expiring in 30 days.")
+    exit(0)
+
+html_rows = "".join([
+    f"<tr><td>{e['displayName']}</td><td>{e['appId']}</td><td>{e['expiryDate']}</td><td>{e['owners']}</td></tr>"
+    for e in expiring
+])
+html_body = f"""
+<html>
+<head>
+  <style>
+    table {{ border-collapse: collapse; }}
+    th, td {{ border: 1px solid black; padding: 8px; }}
+  </style>
+</head>
+<body>
+  <h3>Expiring Azure App Registration Secrets (Next 30 Days)</h3>
+  <table>
+    <tr><th>App Name</th><th>App ID</th><th>Expiry Date</th><th>Owners</th></tr>
+    {html_rows}
+  </table>
+</body>
+</html>
+"""
+
+send_mail_url = f"https://graph.microsoft.com/v1.0/users/{SENDER_EMAIL}/sendMail"
+email_message = {
+    "message": {
+        "subject": "⚠️ App Secrets Expiring in Next 30 Days",
+        "body": {
+            "contentType": "HTML",
+            "content": html_body
+        },
+        "toRecipients": [{"emailAddress": {"address": RECIPIENT_EMAIL}}]
+    }
+}
+
+mail_resp = requests.post(send_mail_url, headers=headers, json=email_message)
+if mail_resp.status_code == 202:
+    print("Email sent successfully.")
+else:
+    print(f"Failed to send email: {mail_resp.text}")
