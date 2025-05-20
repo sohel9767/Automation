@@ -1,0 +1,118 @@
+import requests
+import datetime
+import msal
+
+# ==========
+# CONFIGURATION - Fill these in
+# ==========
+
+TENANT_ID = "your-tenant-id-here"
+CLIENT_ID = "your-client-id-here"
+CLIENT_SECRET = "your-client-secret-here"
+SENDER_EMAIL = "sender@yourdomain.com"          # Must be a valid mailbox in your tenant
+RECIPIENT_EMAIL = "recipient@yourdomain.com"    # Who will receive the email
+
+# ========== END CONFIG ==========
+
+GRAPH_AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
+GRAPH_API_ENDPOINT = "https://graph.microsoft.com/v1.0"
+
+def get_access_token():
+    app = msal.ConfidentialClientApplication(
+        CLIENT_ID, authority=GRAPH_AUTHORITY, client_credential=CLIENT_SECRET
+    )
+    token_response = app.acquire_token_for_client(scopes=GRAPH_SCOPE)
+    if "access_token" in token_response:
+        return token_response["access_token"]
+    else:
+        raise Exception(f"Access token error: {token_response.get('error_description')}")
+
+def get_app_registrations(access_token):
+    url = f"{GRAPH_API_ENDPOINT}/applications?$select=appId,displayName,passwordCredentials"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    apps = []
+    while url:
+        resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        apps.extend(data.get("value", []))
+        url = data.get("@odata.nextLink", None)
+    return apps
+
+def get_owners(access_token, app_id):
+    url = f"{GRAPH_API_ENDPOINT}/applications/{app_id}/owners"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = requests.get(url, headers=headers)
+    if resp.status_code == 200:
+        data = resp.json()
+        names = [owner.get("displayName", "") for owner in data.get("value", [])]
+        return ", ".join(names)
+    return ""
+
+def send_email(access_token, subject, html_body):
+    url = f"{GRAPH_API_ENDPOINT}/users/{SENDER_EMAIL}/sendMail"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "message": {
+            "subject": subject,
+            "body": {
+                "contentType": "HTML",
+                "content": html_body
+            },
+            "toRecipients": [{"emailAddress": {"address": RECIPIENT_EMAIL}}]
+        }
+    }
+    resp = requests.post(url, headers=headers, json=payload)
+    if resp.status_code != 202:
+        raise Exception(f"Failed to send email: {resp.text}")
+
+def main():
+    access_token = get_access_token()
+    apps = get_app_registrations(access_token)
+
+    today = datetime.datetime.utcnow()
+    expiring = []
+
+    for app in apps:
+        app_name = app.get("displayName", "")
+        app_id = app.get("appId", "")
+        for secret in app.get("passwordCredentials", []):
+            end = secret.get("endDateTime")
+            if not end:
+                continue
+            end_date = datetime.datetime.strptime(end, "%Y-%m-%dT%H:%M:%SZ")
+            days_left = (end_date - today).days
+            if 0 <= days_left <= 30:
+                owner = get_owners(access_token, app.get("id", ""))
+                expiring.append({
+                    "App Name": app_name,
+                    "App Id": app_id,
+                    "Expires On": end_date.strftime("%Y-%m-%d"),
+                    "Days Left": days_left,
+                    "Owner": owner
+                })
+
+    if not expiring:
+        print("No secrets expiring in the next 30 days.")
+        return
+
+    html = """
+    <h3>Expiring Secrets in Azure AD App Registrations (Next 30 Days)</h3>
+    <table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse;">
+    <thead><tr>
+        <th>App Name</th><th>App Id</th><th>Expires On</th><th>Days Left</th><th>Owner</th>
+    </tr></thead><tbody>
+    """
+    for item in expiring:
+        html += f"<tr><td>{item['App Name']}</td><td>{item['App Id']}</td><td>{item['Expires On']}</td><td>{item['Days Left']}</td><td>{item['Owner'] or ''}</td></tr>"
+    html += "</tbody></table>"
+
+    send_email(access_token, "Azure AD App Secret Expiry Alert", html)
+    print("Email sent with expiring secrets.")
+
+if __name__ == "__main__":
+    main()
