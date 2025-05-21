@@ -1,0 +1,52 @@
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+def send_email(expiring_apps):
+    sender = "noreply@example.com"  # change if needed
+    receiver = "youremail@example.com"  # change for testing
+    subject = "⚠️ Azure App Registration Secrets Expiring Soon"
+
+    # Build HTML body
+    html = """
+    <html>
+    <body>
+        <p>Hello Team,</p>
+        <p>The following Azure App Registration secrets are expiring within 30 days:</p>
+        <table border="1" cellpadding="5" cellspacing="0">
+            <tr>
+                <th>App Name</th>
+                <th>Expiry Date</th>
+                <th>Owners</th>
+            </tr>
+    """
+    for app in expiring_apps:
+        html += f"""
+            <tr>
+                <td>{app['app']}</td>
+                <td>{app['expiry']}</td>
+                <td>{", ".join(app['owners'])}</td>
+            </tr>
+        """
+
+    html += """
+        </table>
+        <p>Regards,<br/>Azure Automation</p>
+    </body>
+    </html>
+    """
+
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['To'] = receiver
+
+    msg.attach(MIMEText(html, 'html'))
+
+    # Send email
+    try:
+        with smtplib.SMTP('your.smtp.server', 25) as server:
+            server.sendmail(msg['From'], [msg['To']], msg.as_string())
+        print("Email sent successfully.")
+    except Exception as e:
+        print("Failed to send email:", str(e))
