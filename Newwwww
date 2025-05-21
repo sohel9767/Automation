@@ -1,0 +1,63 @@
+import requests
+import datetime
+import os
+from email_helper import send_email
+
+# Environment variables
+TENANT_ID = os.environ['TENANT_ID']
+CLIENT_ID = os.environ['CLIENT_ID']
+CLIENT_SECRET = os.environ['CLIENT_SECRET']
+
+# Token request
+token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+token_data = {
+    "client_id": CLIENT_ID,
+    "client_secret": CLIENT_SECRET,
+    "scope": "https://graph.microsoft.com/.default",
+    "grant_type": "client_credentials"
+}
+token_resp = requests.post(token_url, data=token_data).json()
+access_token = token_resp['access_token']
+
+# Headers
+headers = {
+    'Authorization': f'Bearer {access_token}',
+    'Content-Type': 'application/json'
+}
+
+# Get all app registrations
+apps_url = "https://graph.microsoft.com/v1.0/applications"
+apps = requests.get(apps_url, headers=headers).json()
+
+expiring_soon = []
+today = datetime.datetime.now(datetime.timezone.utc)
+threshold = today + datetime.timedelta(days=30)
+
+for app in apps['value']:
+    app_id = app['id']
+    display_name = app.get('displayName', 'N/A')
+
+    for password in app.get('passwordCredentials', []):
+        expiry_str = password['endDateTime']
+        try:
+            expiry = datetime.datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+        except ValueError:
+            continue
+
+        if today < expiry <= threshold:
+            # Get owners
+            owners_url = f"https://graph.microsoft.com/v1.0/applications/{app_id}/owners"
+            owners_resp = requests.get(owners_url, headers=headers).json()
+            owner_emails = [owner['userPrincipalName'] for owner in owners_resp.get('value', []) if 'userPrincipalName' in owner]
+
+            expiring_soon.append({
+                "app": display_name,
+                "expiry": expiry_str,
+                "owners": owner_emails or ["No owner found"]
+            })
+
+# If there are any expiring soon secrets, send email
+if expiring_soon:
+    send_email(expiring_soon)
+else:
+    print("No secrets expiring in the next 30 days.")
